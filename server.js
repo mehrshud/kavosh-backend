@@ -1,4 +1,4 @@
-// server.js - Final version with dynamic key rotation and live Telegram search
+// server.js - Final version with CORS fix and live Telegram search
 const express = require("express");
 const cors = require("cors");
 const helmet = require("helmet");
@@ -14,13 +14,12 @@ const app = express();
 const PORT = process.env.PORT || 5000;
 
 // --- DYNAMIC API Key Manager ---
-// This function finds all keys for a service (e.g., TWITTER_BEARER_TOKEN, TWITTER_BEARER_TOKEN_2)
 const loadApiKeys = (baseName) => {
   return Object.keys(process.env)
     .filter((key) => key.startsWith(baseName))
-    .sort() // Ensures correct order (TOKEN, TOKEN_2, etc.)
+    .sort()
     .map((key) => process.env[key])
-    .filter(Boolean); // Removes any empty keys
+    .filter(Boolean);
 };
 
 const apiKeys = {
@@ -95,6 +94,7 @@ app.use(
   helmet({ contentSecurityPolicy: false, crossOriginEmbedderPolicy: false })
 );
 
+// --- CORS FIX ---
 const allowedOrigins = [
   "http://localhost:3000",
   "https://newkavosh.vercel.app",
