@@ -1,4 +1,4 @@
-// server.js - Fixed CORS and error handling
+// server.js - Railway compatible version with proper signal handling
 const express = require("express");
 const cors = require("cors");
 const helmet = require("helmet");
@@ -6,19 +6,65 @@ const rateLimit = require("express-rate-limit");
 const fetch = require("node-fetch");
 require("dotenv").config();
 
-const { TelegramClient, Api } = require("telegram");
-const { StringSession } = require("telegram/sessions");
-const input = require("input");
-
 const app = express();
-const PORT = process.env.PORT || 5000;
+const PORT = process.env.PORT || 8080; // Railway uses 8080 by default
 
-// --- CORS FIX - This is the main issue ---
+// === RAILWAY-SPECIFIC FIXES ===
+// 1. Handle process signals properly for Railway
+process.on("SIGTERM", () => {
+  console.log("👋 SIGTERM received, shutting down gracefully");
+  server.close(() => {
+    console.log("✅ Server closed");
+    process.exit(0);
+  });
+});
+
+process.on("SIGINT", () => {
+  console.log("👋 SIGINT received, shutting down gracefully");
+  server.close(() => {
+    console.log("✅ Server closed");
+    process.exit(0);
+  });
+});
+
+// 2. Enhanced CORS for Railway
+app.use((req, res, next) => {
+  const allowedOrigins = [
+    "https://newkavosh.vercel.app",
+    "http://localhost:3000",
+    "https://localhost:3000",
+    process.env.FRONTEND_URL,
+  ].filter(Boolean);
+
+  const origin = req.headers.origin;
+  if (allowedOrigins.includes(origin)) {
+    res.setHeader("Access-Control-Allow-Origin", origin);
+  }
+
+  res.setHeader(
+    "Access-Control-Allow-Methods",
+    "GET, POST, PUT, DELETE, OPTIONS"
+  );
+  res.setHeader(
+    "Access-Control-Allow-Headers",
+    "Content-Type, Authorization, Accept, Origin, X-Requested-With"
+  );
+  res.setHeader("Access-Control-Allow-Credentials", "true");
+  res.setHeader("Access-Control-Max-Age", "86400");
+
+  if (req.method === "OPTIONS") {
+    res.status(200).end();
+    return;
+  }
+
+  next();
+});
+
+// Standard CORS as backup
 const corsOptions = {
   origin: [
     "http://localhost:3000",
     "https://newkavosh.vercel.app",
-    "https://kavosh-frontend.vercel.app", // Add any other domains
     process.env.FRONTEND_URL,
   ].filter(Boolean),
   credentials: true,
@@ -33,17 +79,11 @@ const corsOptions = {
   ],
 };
 
-// Apply CORS before other middleware
 app.use(cors(corsOptions));
 
-// Handle preflight requests
-app.options("*", cors(corsOptions));
-
-// --- Middleware Setup ---
+// Middleware
 app.use(express.json({ limit: "10mb" }));
 app.use(express.urlencoded({ extended: true }));
-
-// Helmet with relaxed settings
 app.use(
   helmet({
     contentSecurityPolicy: false,
@@ -52,196 +92,137 @@ app.use(
   })
 );
 
-// Rate limiting
+// Rate limiting (more lenient for development)
 const limiter = rateLimit({
   windowMs: 15 * 60 * 1000,
-  max: 200, // Increased limit
-  message: "Too many requests from this IP",
+  max: 200,
+  message: { error: "Too many requests from this IP" },
 });
 app.use("/api", limiter);
 
-// --- DYNAMIC API Key Manager ---
-const loadApiKeys = (baseName) => {
-  return Object.keys(process.env)
-    .filter((key) => key.startsWith(baseName))
-    .sort()
-    .map((key) => process.env[key])
-    .filter(Boolean);
-};
-
+// === SIMPLIFIED API KEY MANAGEMENT ===
 const apiKeys = {
-  openai: loadApiKeys("OPENAI_API_KEY"),
-  gemini: loadApiKeys("GEMINI_API_KEY"),
-  twitter: loadApiKeys("TWITTER_BEARER_TOKEN"),
+  openai: [
+    process.env.OPENAI_API_KEY_1,
+    process.env.OPENAI_API_KEY_2,
+    process.env.OPENAI_API_KEY_3,
+  ].filter(Boolean),
+  twitter: [
+    process.env.TWITTER_BEARER_TOKEN_1,
+    process.env.TWITTER_BEARER_TOKEN_2,
+    process.env.TWITTER_BEARER_TOKEN_3,
+  ].filter(Boolean),
+  gemini: [process.env.GEMINI_API_KEY_1, process.env.GEMINI_API_KEY_2].filter(
+    Boolean
+  ),
 };
 
-const keyManager = {
-  indices: { openai: 0, gemini: 0, twitter: 0 },
-  getKey: function (service) {
-    const keys = apiKeys[service];
-    if (!keys || keys.length === 0) return null;
-    return keys[this.indices[service]];
-  },
-  rotateKey: function (service) {
-    const keys = apiKeys[service];
-    if (!keys || keys.length < 2) return;
-    this.indices[service] = (this.indices[service] + 1) % keys.length;
-    console.log(
-      `🔄 Rotated ${service} key. New index: ${this.indices[service]}`
-    );
-  },
+console.log(
+  `🔑 Loaded ${apiKeys.twitter.length} Twitter keys, ${apiKeys.openai.length} OpenAI keys, ${apiKeys.gemini.length} Gemini keys`
+);
+
+// Simple key rotation
+let keyIndices = { openai: 0, twitter: 0, gemini: 0 };
+const getApiKey = (service) => {
+  const keys = apiKeys[service] || [];
+  if (keys.length === 0) return null;
+  return keys[keyIndices[service] % keys.length];
 };
 
-console.log(`🔑 Loaded ${apiKeys.twitter.length} Twitter keys.`);
-console.log(`🔑 Loaded ${apiKeys.openai.length} OpenAI keys.`);
-console.log(`🔑 Loaded ${apiKeys.gemini.length} Gemini keys.`);
+const rotateKey = (service) => {
+  if (apiKeys[service] && apiKeys[service].length > 1) {
+    keyIndices[service] = (keyIndices[service] + 1) % apiKeys[service].length;
+    console.log(`🔄 Rotated ${service} key to index ${keyIndices[service]}`);
+  }
+};
 
-// --- Telegram Client Setup ---
-let telegramClient = null;
-const telegramApiId = parseInt(process.env.TELEGRAM_API_ID);
-const telegramApiHash = process.env.TELEGRAM_API_HASH;
-
-// Only initialize Telegram if credentials are available
-if (telegramApiId && telegramApiHash) {
-  const telegramSession = new StringSession(process.env.TELEGRAM_SESSION || "");
-  telegramClient = new TelegramClient(
-    telegramSession,
-    telegramApiId,
-    telegramApiHash,
-    {
-      connectionRetries: 3,
-      timeout: 10000,
-    }
-  );
-
-  (async () => {
-    try {
-      console.log("Attempting to connect to Telegram...");
-      await telegramClient.start({
-        phoneNumber: process.env.TELEGRAM_PHONE_NUMBER,
-        password: async () =>
-          await input.text("Please enter your 2FA password: "),
-        phoneCode: async () =>
-          await input.text("Please enter the code you received: "),
-        onError: (err) => console.error("Telegram connection error:", err),
-      });
-      console.log("✅ Telegram client is connected and ready.");
-    } catch (err) {
-      console.error("🔴 Failed to connect to Telegram:", err.message);
-      telegramClient = null; // Disable telegram if connection fails
-    }
-  })();
-} else {
-  console.log(
-    "⚠️ Telegram credentials not provided. Telegram search will return mock data."
-  );
-}
-
-// --- Helper Functions ---
-const createStandardResponse = (success, data = null, message = null) => ({
+// === HELPER FUNCTIONS ===
+const createResponse = (success, data = null, message = null) => ({
   success,
   data,
   message,
   timestamp: new Date().toISOString(),
 });
 
-// --- Live Telegram Search Function ---
-async function makeTelegramSearch(query, count) {
-  if (!telegramClient || !telegramClient.connected) {
-    console.log("⚠️ Telegram not available, returning mock data");
-    return createMockResults("telegram", query, count);
-  }
+// Mock data generator for platforms without API access
+function generateMockResults(platform, query, count) {
+  const results = Array.from({ length: Math.min(count, 8) }, (_, i) => ({
+    id: `${platform}_${Date.now()}_${i}`,
+    text: `نمونه محتوا برای "${query}" در ${platform} - پست ${
+      i + 1
+    }. این یک نمونه داده برای نمایش عملکرد سیستم است.`,
+    content: `نمونه محتوا برای "${query}" در ${platform} - پست ${
+      i + 1
+    }. این یک نمونه داده برای نمایش عملکرد سیستم است.`,
+    author: {
+      username: `user_${i}`,
+      name: `کاربر ${i + 1}`,
+    },
+    metrics: {
+      like_count: Math.floor(Math.random() * 1000) + 10,
+      reply_count: Math.floor(Math.random() * 100) + 1,
+      retweet_count: Math.floor(Math.random() * 200) + 5,
+      impression_count: Math.floor(Math.random() * 5000) + 100,
+      likes: Math.floor(Math.random() * 1000) + 10,
+      comments: Math.floor(Math.random() * 100) + 1,
+      shares: Math.floor(Math.random() * 200) + 5,
+      views: Math.floor(Math.random() * 5000) + 100,
+    },
+    created_at: new Date(Date.now() - i * 3600000).toISOString(),
+    date: new Date(Date.now() - i * 3600000).toISOString(),
+    url: `#mock-${platform}-${i}`,
+    platform: platform,
+    sentiment: ["positive", "neutral", "negative"][
+      Math.floor(Math.random() * 3)
+    ],
+    media_url:
+      Math.random() > 0.8 ? `https://picsum.photos/400/300?random=${i}` : null,
+    media_type: Math.random() > 0.8 ? "image" : "text",
+  }));
 
-  try {
-    const results = await telegramClient.invoke(
-      new Api.messages.SearchGlobal({
-        q: query,
-        limit: count,
-        filter: new Api.InputMessagesFilterEmpty(),
-        offsetRate: 0,
-        offsetPeer: new Api.InputPeerEmpty(),
-        offsetId: 0,
-      })
-    );
-
-    const formattedMessages = results.messages.map((msg) => {
-      const channelId = msg.peerId?.channelId?.toString();
-      return {
-        id: `telegram_${channelId}_${msg.id}`,
-        text: msg.message || "[Media content]",
-        content: msg.message || "[Media content]",
-        author: `Channel ${channelId || "Unknown"}`,
-        metrics: {
-          views: msg.views || 0,
-          likes: 0,
-          comments: 0,
-          shares: 0,
-          like_count: 0,
-          reply_count: 0,
-          retweet_count: 0,
-          impression_count: msg.views || 0,
-        },
-        created_at: new Date(msg.date * 1000).toISOString(),
-        date: new Date(msg.date * 1000).toISOString(),
-        url: channelId ? `https://t.me/${channelId}/${msg.id}` : "#",
-        platform: "telegram",
-        sentiment: ["positive", "neutral", "negative"][
-          Math.floor(Math.random() * 3)
-        ],
-        media_url: null,
-        media_type: "text",
-      };
-    });
-
-    return {
-      success: true,
-      data: {
-        results: formattedMessages,
-        total: formattedMessages.length,
-        platform: "telegram",
-      },
-    };
-  } catch (error) {
-    console.error("🔴 Telegram search API error:", error);
-    // Return mock data if telegram fails
-    return createMockResults("telegram", query, count);
-  }
+  return {
+    success: true,
+    data: {
+      results,
+      total: results.length,
+      platform,
+      note: `نمونه داده برای ${platform} - در نسخه نهایی با API واقعی جایگزین می‌شود`,
+    },
+  };
 }
 
-// --- Twitter Search Function ---
-async function makeTwitterSearch(query, count) {
-  const maxRetries = Math.max((apiKeys.twitter || []).length, 1);
+// Twitter search function with proper error handling
+async function searchTwitter(query, count) {
+  const maxAttempts = Math.max(apiKeys.twitter.length, 1);
 
-  for (let attempt = 0; attempt < maxRetries; attempt++) {
-    const currentKey = keyManager.getKey("twitter");
-    if (!currentKey) {
-      console.log("⚠️ No Twitter API keys, returning mock data");
-      return createMockResults("twitter", query, count);
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    const apiKey = getApiKey("twitter");
+    if (!apiKey) {
+      console.log("⚠️ No Twitter API key available, using mock data");
+      return generateMockResults("twitter", query, count);
     }
 
     try {
-      const twitterUrl = `https://api.twitter.com/2/tweets/search/recent?query=${encodeURIComponent(
+      const url = `https://api.twitter.com/2/tweets/search/recent?query=${encodeURIComponent(
         query
       )}&max_results=${Math.min(
         count,
         100
-      )}&tweet.fields=created_at,public_metrics,author_id&expansions=author_id&user.fields=username,verified`;
+      )}&tweet.fields=created_at,public_metrics,author_id&expansions=author_id&user.fields=username`;
 
-      const response = await fetch(twitterUrl, {
-        headers: { Authorization: `Bearer ${currentKey}` },
+      const response = await fetch(url, {
+        headers: { Authorization: `Bearer ${apiKey}` },
         timeout: 15000,
       });
 
       if (response.status === 429 || response.status === 401) {
-        keyManager.rotateKey("twitter");
-        if (attempt === maxRetries - 1) {
-          return createMockResults("twitter", query, count);
-        }
+        console.log(`Twitter API key failed (${response.status}), rotating...`);
+        rotateKey("twitter");
         continue;
       }
 
       if (!response.ok) {
-        throw new Error(`Twitter API Error: ${response.status}`);
+        throw new Error(`Twitter API error: ${response.status}`);
       }
 
       const data = await response.json();
@@ -279,93 +260,41 @@ async function makeTwitterSearch(query, count) {
         data: { results, total: results.length, platform: "twitter" },
       };
     } catch (error) {
-      console.error(`🔴 Twitter attempt ${attempt + 1} failed:`, error.message);
-      if (attempt === maxRetries - 1) {
-        return createMockResults("twitter", query, count);
+      console.error(`Twitter attempt ${attempt + 1} failed:`, error.message);
+      if (attempt === maxAttempts - 1) {
+        return generateMockResults("twitter", query, count);
       }
     }
   }
 }
 
-// Mock results for platforms without API access
-function createMockResults(platform, query, count) {
-  const results = Array.from({ length: Math.min(count, 10) }, (_, i) => ({
-    id: `mock_${platform}_${Date.now()}_${i}`,
-    text: `نمونه محتوای ${platform} برای جستجوی "${query}" - پست شماره ${
-      i + 1
-    }. این محتوا نمونه‌ای است که نشان‌دهنده نحوه نمایش نتایج واقعی می‌باشد.`,
-    content: `نمونه محتوای ${platform} برای جستجوی "${query}" - پست شماره ${
-      i + 1
-    }. این محتوا نمونه‌ای است که نشان‌دهنده نحوه نمایش نتایج واقعی می‌باشد.`,
-    author: {
-      username: `user_${platform}_${i}`,
-      name: `کاربر ${i + 1}`,
-    },
-    metrics: {
-      like_count: Math.floor(Math.random() * 500) + 10,
-      reply_count: Math.floor(Math.random() * 50) + 1,
-      retweet_count: Math.floor(Math.random() * 100) + 5,
-      impression_count: Math.floor(Math.random() * 1000) + 100,
-      likes: Math.floor(Math.random() * 500) + 10,
-      comments: Math.floor(Math.random() * 50) + 1,
-      shares: Math.floor(Math.random() * 100) + 5,
-      views: Math.floor(Math.random() * 1000) + 100,
-    },
-    created_at: new Date(Date.now() - i * 3600000).toISOString(),
-    date: new Date(Date.now() - i * 3600000).toISOString(),
-    url: `#mock-${platform}-${i}`,
-    platform: platform,
-    sentiment: ["positive", "neutral", "negative"][
-      Math.floor(Math.random() * 3)
-    ],
-    media_url:
-      Math.random() > 0.7 ? `https://picsum.photos/400/300?random=${i}` : null,
-    media_type: Math.random() > 0.7 ? "image" : "text",
-  }));
+// === API ENDPOINTS ===
 
-  return {
-    success: true,
-    data: {
-      results,
-      total: results.length,
-      platform: platform,
-      note: `نمونه داده برای ${platform} - در نسخه کامل، داده‌های واقعی نمایش داده خواهد شد.`,
-    },
-  };
-}
-
-// --- API Endpoints ---
-
-// Health check endpoint
+// Health check - simple and reliable
 app.get("/health", (req, res) => {
   res.json({
     status: "healthy",
     timestamp: new Date().toISOString(),
+    environment: process.env.NODE_ENV || "development",
+    port: PORT,
     services: {
-      telegram:
-        telegramClient && telegramClient.connected
-          ? "connected"
-          : "disconnected",
       twitter: apiKeys.twitter.length > 0 ? "configured" : "not configured",
       openai: apiKeys.openai.length > 0 ? "configured" : "not configured",
+      cors: "enabled",
     },
   });
 });
 
-// Multi-platform search endpoint
+// Multi-platform search
 app.post("/api/search/multi", async (req, res) => {
   try {
     const { query, platforms = [], count = 20 } = req.body;
 
-    if (!query || !query.trim()) {
+    if (!query?.trim()) {
       return res
         .status(400)
         .json(
-          createStandardResponse(
-            false,
-            null,
-            "Query is required and cannot be empty"
-          )
+          createResponse(false, null, "Query is required and cannot be empty")
         );
     }
 
@@ -373,57 +302,48 @@ app.post("/api/search/multi", async (req, res) => {
       return res
         .status(400)
         .json(
-          createStandardResponse(
-            false,
-            null,
-            "At least one platform must be specified"
-          )
+          createResponse(false, null, "At least one platform must be specified")
         );
     }
 
-    console.log(
-      `🔍 Searching for "${query}" across platforms: ${platforms.join(", ")}`
+    console.log(`🔍 Searching "${query}" across: ${platforms.join(", ")}`);
+
+    // Process each platform
+    const searchResults = await Promise.allSettled(
+      platforms.map(async (platform) => {
+        try {
+          switch (platform.toLowerCase()) {
+            case "twitter":
+              return await searchTwitter(query, count);
+            case "telegram":
+            case "instagram":
+            case "facebook":
+            case "eitaa":
+            case "rubika":
+              return generateMockResults(platform, query, count);
+            default:
+              throw new Error(`Unsupported platform: ${platform}`);
+          }
+        } catch (error) {
+          return {
+            success: false,
+            error: error.message,
+            data: { platform },
+          };
+        }
+      })
     );
 
-    const searchPromises = platforms.map(async (platform) => {
-      try {
-        switch (platform.toLowerCase()) {
-          case "twitter":
-            return await makeTwitterSearch(query, count);
-          case "telegram":
-            return await makeTelegramSearch(query, count);
-          case "instagram":
-          case "facebook":
-          case "eitaa":
-          case "rubika":
-            return createMockResults(platform, query, count);
-          default:
-            return {
-              success: false,
-              error: `Unsupported platform: ${platform}`,
-              data: { platform: platform },
-            };
-        }
-      } catch (error) {
-        console.error(`Error searching ${platform}:`, error);
-        return {
-          success: false,
-          error: error.message,
-          data: { platform: platform },
-        };
-      }
-    });
-
-    const results = await Promise.allSettled(searchPromises);
+    // Compile results
     const platformResults = {};
     let totalResults = 0;
 
-    results.forEach((result, index) => {
+    searchResults.forEach((result, index) => {
       const platformName = platforms[index];
       if (result.status === "fulfilled" && result.value) {
         platformResults[platformName] = result.value;
-        if (result.value.success && result.value.data) {
-          totalResults += result.value.data.total || 0;
+        if (result.value.success) {
+          totalResults += result.value.data?.total || 0;
         }
       } else {
         platformResults[platformName] = {
@@ -434,22 +354,20 @@ app.post("/api/search/multi", async (req, res) => {
       }
     });
 
-    const response = createStandardResponse(true, {
-      platforms: platformResults,
-      total: totalResults,
-      query: query.trim(),
-      searchedPlatforms: platforms,
-    });
-
     console.log(`✅ Search completed. Total results: ${totalResults}`);
-    res.json(response);
+    res.json(
+      createResponse(true, {
+        platforms: platformResults,
+        total: totalResults,
+        query: query.trim(),
+        searchedPlatforms: platforms,
+      })
+    );
   } catch (error) {
-    console.error("🔴 Multi-search error:", error);
+    console.error("🔴 Search error:", error);
     res
       .status(500)
-      .json(
-        createStandardResponse(false, null, `Server error: ${error.message}`)
-      );
+      .json(createResponse(false, null, `Server error: ${error.message}`));
   }
 });
 
@@ -458,128 +376,81 @@ app.post("/api/ai/enhance", async (req, res) => {
   try {
     const { text, query, service = "openai" } = req.body;
 
-    if (!text || !text.trim()) {
+    if (!text?.trim()) {
       return res
         .status(400)
-        .json(
-          createStandardResponse(
-            false,
-            null,
-            "Text is required for AI analysis."
-          )
-        );
+        .json(createResponse(false, null, "Text is required for AI analysis"));
     }
 
-    if (service !== "openai") {
-      return res
-        .status(400)
-        .json(
-          createStandardResponse(
-            false,
-            null,
-            "Only OpenAI is supported currently."
-          )
-        );
+    const apiKey = getApiKey("openai");
+    if (!apiKey) {
+      return res.json(
+        createResponse(true, {
+          analysis: `تحلیل خودکار برای "${query}": بر اساس نتایج جستجو، محتوای مرتبطی یافت شده است. متاسفانه سرویس تحلیل هوش مصنوعی در حال حاضر در دسترس نیست.`,
+        })
+      );
     }
 
-    const maxRetries = Math.max((apiKeys.openai || []).length, 1);
-
-    for (let attempt = 0; attempt < maxRetries; attempt++) {
-      const currentKey = keyManager.getKey("openai");
-      if (!currentKey) {
-        return res.json(
-          createStandardResponse(true, {
-            analysis: `تحلیل خودکار برای "${query}": متاسفانه سرویس تحلیل هوش مصنوعی در حال حاضر در دسترس نیست. با این حال، از نتایج جستجو می‌توان استنباط کرد که محتوای مرتبط با موضوع مورد نظر شما در پلتفرم‌های مختلف یافت شده است.`,
-          })
-        );
-      }
-
-      try {
-        const response = await fetch(
-          "https://api.openai.com/v1/chat/completions",
-          {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-              Authorization: `Bearer ${currentKey}`,
-            },
-            body: JSON.stringify({
-              model: "gpt-3.5-turbo",
-              messages: [
-                {
-                  role: "system",
-                  content:
-                    "You are a helpful social media analyst. Analyze the following content and respond in Persian (Farsi).",
-                },
-                {
-                  role: "user",
-                  content: `لطفاً نتایج زیر را که مربوط به جستجوی "${query}" است تحلیل کن و خلاصه‌ای از نکات کلیدی و احساسات کلی ارائه ده:\n\n${text.substring(
-                    0,
-                    3000
-                  )}`,
-                },
-              ],
-              max_tokens: 300,
-              temperature: 0.5,
-            }),
-          }
-        );
-
-        if (response.status === 429 || response.status === 401) {
-          console.warn(`OpenAI key failed (${response.status}), rotating...`);
-          keyManager.rotateKey("openai");
-          if (attempt === maxRetries - 1) {
-            return res.json(
-              createStandardResponse(true, {
-                analysis: `تحلیل خودکار: بر اساس نتایج جستجو برای "${query}"، محتوای متنوعی یافت شده است. لطفاً برای تحلیل دقیق‌تر، مجدداً تلاش کنید.`,
-              })
-            );
-          }
-          continue;
+    try {
+      const response = await fetch(
+        "https://api.openai.com/v1/chat/completions",
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${apiKey}`,
+          },
+          body: JSON.stringify({
+            model: "gpt-3.5-turbo",
+            messages: [
+              {
+                role: "system",
+                content:
+                  "You are a helpful social media analyst. Respond in Persian (Farsi).",
+              },
+              {
+                role: "user",
+                content: `لطفاً محتوای زیر را که مربوط به جستجوی "${query}" است تحلیل کن و خلاصه کوتاهی از نکات اصلی و احساسات کلی ارائه ده:\n\n${text.substring(
+                  0,
+                  2000
+                )}`,
+              },
+            ],
+            max_tokens: 250,
+            temperature: 0.5,
+          }),
         }
+      );
 
-        if (!response.ok) {
-          const errorBody = await response.json();
-          throw new Error(
-            errorBody.error?.message || `OpenAI API Error: ${response.status}`
-          );
-        }
-
+      if (response.ok) {
         const data = await response.json();
         const analysis = data.choices?.[0]?.message?.content?.trim();
-
-        return res.json(createStandardResponse(true, { analysis }));
-      } catch (error) {
-        console.error(`AI attempt ${attempt + 1} failed:`, error.message);
-        if (attempt === maxRetries - 1) {
-          return res.json(
-            createStandardResponse(true, {
-              analysis: `تحلیل خودکار برای "${query}": بر اساس داده‌های جمع‌آوری شده، نتایج متنوعی یافت شده است. برای دریافت تحلیل دقیق‌تر، لطفاً مجدداً تلاش کنید.`,
-            })
-          );
-        }
+        return res.json(createResponse(true, { analysis }));
+      } else {
+        throw new Error(`OpenAI API error: ${response.status}`);
       }
+    } catch (aiError) {
+      console.warn("AI analysis failed:", aiError.message);
+      return res.json(
+        createResponse(true, {
+          analysis: `تحلیل خودکار: بر اساس نتایج جستجو برای "${query}"، محتوای متنوعی یافت شده است. برای تحلیل دقیق‌تر، لطفاً مجدداً تلاش کنید.`,
+        })
+      );
     }
   } catch (error) {
     console.error("🔴 AI enhancement error:", error);
     res
       .status(500)
-      .json(
-        createStandardResponse(
-          false,
-          null,
-          `AI service error: ${error.message}`
-        )
-      );
+      .json(createResponse(false, null, `AI service error: ${error.message}`));
   }
 });
 
-// Catch-all for 404s
+// 404 handler
 app.use("*", (req, res) => {
   res
     .status(404)
     .json(
-      createStandardResponse(
+      createResponse(
         false,
         null,
         `Endpoint not found: ${req.method} ${req.originalUrl}`
@@ -590,32 +461,19 @@ app.use("*", (req, res) => {
 // Global error handler
 app.use((error, req, res, next) => {
   console.error("🔴 Global error:", error);
-  res
-    .status(500)
-    .json(createStandardResponse(false, null, "Internal server error"));
+  res.status(500).json(createResponse(false, null, "Internal server error"));
 });
 
-// Handle process termination gracefully
-process.on("SIGTERM", async () => {
-  console.log("🛑 SIGTERM received. Shutting down gracefully...");
-  if (telegramClient && telegramClient.connected) {
-    await telegramClient.disconnect();
-    console.log("✅ Telegram client disconnected");
-  }
-  process.exit(0);
+// Start server
+const server = app.listen(PORT, "0.0.0.0", () => {
+  console.log(`🚀 Kavosh Backend running on port ${PORT}`);
+  console.log(`🌐 Environment: ${process.env.NODE_ENV || "development"}`);
+  console.log(`🔧 CORS enabled for: ${corsOptions.origin.join(", ")}`);
 });
 
-process.on("SIGINT", async () => {
-  console.log("🛑 SIGINT received. Shutting down gracefully...");
-  if (telegramClient && telegramClient.connected) {
-    await telegramClient.disconnect();
-    console.log("✅ Telegram client disconnected");
-  }
-  process.exit(0);
+// Graceful shutdown
+server.on("error", (error) => {
+  console.error("🔴 Server error:", error);
 });
 
-app.listen(PORT, () => {
-  console.log(`🚀 Kavosh Backend Server is running on port ${PORT}`);
-  console.log(`🌐 CORS enabled for: ${corsOptions.origin.join(", ")}`);
-  console.log(`🔧 Environment: ${process.env.NODE_ENV || "development"}`);
-});
+console.log("✅ Server setup complete");
