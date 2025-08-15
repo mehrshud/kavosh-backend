@@ -1,4 +1,4 @@
-// server.js - Fixed version with API Key Rotation
+// server.js - Final version with live Telegram search and API key rotation
 const express = require("express");
 const cors = require("cors");
 const helmet = require("helmet");
@@ -6,12 +6,15 @@ const rateLimit = require("express-rate-limit");
 const fetch = require("node-fetch");
 require("dotenv").config();
 
+// --- NEW: Telegram and Input dependencies ---
+const { TelegramClient, Api } = require("telegram");
+const { StringSession } = require("telegram/sessions");
+const input = require("input"); // Used for the one-time login prompt
+
 const app = express();
 const PORT = process.env.PORT || 5000;
 
-// --- NEW: API Key Manager ---
-// This manager handles loading multiple API keys from your .env file
-// and rotating them if one fails (e.g., due to rate limits).
+// --- API Key Manager (for Twitter, OpenAI, etc.) ---
 const apiKeys = {
   openai: [
     process.env.OPENAI_API_KEY,
@@ -32,165 +35,162 @@ const keyManager = {
   getKey: function (service) {
     const keys = apiKeys[service];
     if (!keys || keys.length === 0) return null;
-    const key = keys[this.indices[service]];
-    return key;
+    return keys[this.indices[service]];
   },
   rotateKey: function (service) {
     const keys = apiKeys[service];
-    if (!keys || keys.length < 2) return; // No need to rotate if only one key
+    if (!keys || keys.length < 2) return;
     this.indices[service] = (this.indices[service] + 1) % keys.length;
     console.log(
       `🔄 Rotated ${service} key. New index: ${this.indices[service]}`
     );
   },
 };
-// --- End of API Key Manager ---
 
-process.on("uncaughtException", (error) => {
-  console.error("💥 Uncaught Exception:", error);
-  if (process.env.NODE_ENV !== "production") {
-    process.exit(1);
+// --- Telegram Client Setup ---
+const telegramApiId = parseInt(process.env.TELEGRAM_API_ID);
+const telegramApiHash = process.env.TELEGRAM_API_HASH;
+// Load session from .env if it exists, otherwise it's empty for the first run
+const telegramSession = new StringSession(process.env.TELEGRAM_SESSION || "");
+
+const telegramClient = new TelegramClient(
+  telegramSession,
+  telegramApiId,
+  telegramApiHash,
+  {
+    connectionRetries: 5,
   }
-});
-
-process.on("unhandledRejection", (reason, promise) => {
-  console.error("💥 Unhandled Rejection at:", promise, "reason:", reason);
-  if (process.env.NODE_ENV !== "production") {
-    process.exit(1);
-  }
-});
-
-app.use(
-  helmet({
-    crossOriginEmbedderPolicy: false,
-    contentSecurityPolicy: false,
-  })
 );
 
-const limiter = rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 200,
-  standardHeaders: true,
-  legacyHeaders: false,
-  message: {
-    success: false,
-    message: "Too many requests, please try again after 15 minutes.",
-  },
-});
+(async () => {
+  try {
+    console.log("Attempting to connect to Telegram...");
+    await telegramClient.start({
+      phoneNumber: process.env.TELEGRAM_PHONE_NUMBER,
+      password: async () =>
+        await input.text("Please enter your 2FA password: "),
+      phoneCode: async () =>
+        await input.text("Please enter the code you received: "),
+      onError: (err) => console.error("Telegram connection error:", err),
+    });
+    console.log("✅ Telegram client is connected and ready.");
+
+    // IMPORTANT: This will print the session string on first successful login.
+    // You MUST copy this string and add it to your .env file as TELEGRAM_SESSION.
+    if (!process.env.TELEGRAM_SESSION) {
+      console.log("\n--- IMPORTANT ---");
+      console.log(
+        "COPY THIS SESSION STRING and add it to your environment variables as TELEGRAM_SESSION:"
+      );
+      console.log(telegramClient.session.save());
+      console.log("-----------------\n");
+    }
+  } catch (err) {
+    console.error("🔴 Failed to connect to Telegram:", err.message);
+  }
+})();
+
+// --- Middleware Setup ---
+app.use(
+  helmet({ contentSecurityPolicy: false, crossOriginEmbedderPolicy: false })
+);
+app.use(cors({ origin: [process.env.FRONTEND_URL, "http://localhost:3000"] }));
+app.use(express.json());
+const limiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 100 });
 app.use(limiter);
 
-const allowedOrigins = [
-  "http://localhost:3000",
-  "http://localhost:3001",
-  "https://newkavosh.vercel.app",
-  process.env.FRONTEND_URL,
-].filter(Boolean);
-
-const corsOptions = {
-  origin: (origin, callback) => {
-    if (
-      !origin ||
-      allowedOrigins.includes(origin) ||
-      origin.includes(".vercel.app")
-    ) {
-      callback(null, true);
-    } else {
-      callback(new Error("Not allowed by CORS"));
-    }
-  },
-};
-
-app.use(cors(corsOptions));
-app.use(express.json({ limit: "10mb" }));
-app.use(express.urlencoded({ extended: true, limit: "10mb" }));
-
-const createStandardResponse = (
+// --- Helper Functions ---
+const createStandardResponse = (success, data = null, message = null) => ({
   success,
-  data = null,
-  message = null,
-  platform = null
-) => ({
-  success,
-  timestamp: new Date().toISOString(),
   data,
   message,
-  platform,
 });
 
-app.get("/", (req, res) => {
-  res.json({
-    service: "Kavosh Backend API",
-    version: "1.1.0",
-    status: "running",
-  });
-});
+// --- Live Telegram Search Function ---
+async function makeTelegramSearch(query, count) {
+  if (!telegramClient.connected) {
+    throw new Error(
+      "Telegram client is not connected. Please check server logs."
+    );
+  }
+  try {
+    const results = await telegramClient.invoke(
+      new Api.messages.SearchGlobal({
+        q: query,
+        limit: count,
+        filter: new Api.InputMessagesFilterEmpty(),
+        folderId: null, // Search globally
+      })
+    );
 
-app.get("/health", (req, res) => {
-  res.json({ status: "healthy", timestamp: new Date().toISOString() });
-});
+    const formattedMessages = results.messages.map((msg) => {
+      const channelId = msg.peerId?.channelId?.toString();
+      return {
+        id: `telegram_${channelId}_${msg.id}`,
+        text: msg.message || "[Media content]",
+        author: `Channel ID: ${channelId || "Unknown"}`,
+        metrics: { views: msg.views || 0, likes: 0, comments: 0, shares: 0 },
+        created_at: new Date(msg.date * 1000).toISOString(),
+        url: channelId ? `https://t.me/${channelId}/${msg.id}` : "#",
+        platform: "telegram",
+      };
+    });
 
-// --- UPDATED: Twitter Search Helper with Key Rotation ---
+    return {
+      success: true,
+      data: {
+        results: formattedMessages,
+        total: formattedMessages.length,
+        platform: "telegram",
+      },
+    };
+  } catch (error) {
+    console.error("🔴 Telegram search API error:", error);
+    throw new Error("Failed to perform search on Telegram.");
+  }
+}
+
+// --- Twitter Search Function (with key rotation) ---
 async function makeTwitterSearch(query, count) {
   const maxRetries = (apiKeys.twitter || []).length || 1;
   for (let attempt = 0; attempt < maxRetries; attempt++) {
     const currentKey = keyManager.getKey("twitter");
     if (!currentKey) throw new Error("No valid Twitter API keys configured.");
 
-    console.log(
-      `🐦 Attempting Twitter search with key index: ${keyManager.indices.twitter}`
-    );
     const twitterUrl = `https://api.twitter.com/2/tweets/search/recent?query=${encodeURIComponent(
       query
     )}&max_results=${Math.min(
       count,
       100
     )}&tweet.fields=created_at,public_metrics,author_id&expansions=author_id&user.fields=username,verified`;
-
     const response = await fetch(twitterUrl, {
       headers: { Authorization: `Bearer ${currentKey}` },
     });
 
-    // If rate-limited or key is invalid, rotate and retry
     if (response.status === 429 || response.status === 401) {
-      console.warn(
-        `Twitter API key failed (Status: ${response.status}). Rotating key.`
-      );
       keyManager.rotateKey("twitter");
-      if (attempt === maxRetries - 1) {
+      if (attempt === maxRetries - 1)
         throw new Error(
-          `Twitter API Error: ${response.status} - All keys failed or are rate-limited.`
+          `Twitter API Error: ${response.status} - All keys failed.`
         );
-      }
-      continue; // Try next key
+      continue;
     }
-
-    if (!response.ok) {
-      const errorData = await response.json();
-      throw new Error(
-        errorData.detail || `Twitter API Error: ${response.status}`
-      );
-    }
-
+    if (!response.ok) throw new Error(`Twitter API Error: ${response.status}`);
     const data = await response.json();
     const users =
-      data.includes?.users?.reduce((acc, user) => {
-        acc[user.id] = user;
-        return acc;
-      }, {}) || {};
-
+      data.includes?.users?.reduce(
+        (acc, user) => ({ ...acc, [user.id]: user }),
+        {}
+      ) || {};
     const results = (data.data || []).map((tweet) => ({
       id: tweet.id,
       text: tweet.text,
-      author: users[tweet.author_id] || {
-        name: "Unknown User",
-        username: "unknown",
-      },
+      author: users[tweet.author_id] || { name: "Unknown" },
       metrics: tweet.public_metrics,
       created_at: tweet.created_at,
       url: `https://twitter.com/i/web/status/${tweet.id}`,
       platform: "twitter",
     }));
-
     return {
       success: true,
       data: { results, total: results.length, platform: "twitter" },
@@ -199,7 +199,7 @@ async function makeTwitterSearch(query, count) {
   throw new Error("All Twitter API attempts failed.");
 }
 
-// Helper function to create mock results
+// Mock results for other platforms
 function createMockResults(platform, query, count) {
   const results = Array.from({ length: Math.min(count, 8) }, (_, i) => ({
     id: `mock_${platform}_${Date.now()}_${i}`,
@@ -208,8 +208,6 @@ function createMockResults(platform, query, count) {
     metrics: {
       like_count: Math.floor(Math.random() * 100),
       reply_count: Math.floor(Math.random() * 20),
-      retweet_count: Math.floor(Math.random() * 30),
-      impression_count: Math.floor(Math.random() * 1000),
     },
     created_at: new Date(Date.now() - i * 3600000).toISOString(),
     url: `#`,
@@ -226,50 +224,48 @@ function createMockResults(platform, query, count) {
   };
 }
 
+// --- API Endpoints ---
+app.get("/health", (req, res) => res.json({ status: "healthy" }));
+
 app.post("/api/search/multi", async (req, res) => {
-  const { query, platforms = ["twitter"], count = 20 } = req.body;
-  if (!query) {
+  const { query, platforms = [], count = 20 } = req.body;
+  if (!query)
     return res
       .status(400)
       .json(createStandardResponse(false, null, "Query is required"));
-  }
 
-  const searchPromises = platforms.map(async (platform) => {
-    try {
-      switch (platform) {
-        case "twitter":
-          return await makeTwitterSearch(query, count);
-        // Add cases for other real APIs here in the future
-        case "instagram":
-        case "facebook":
-        case "eitaa":
-        case "telegram":
-        case "rubika":
-        default:
-          return createMockResults(platform, query, count);
-      }
-    } catch (error) {
-      console.error(`💥 Failed to search ${platform}:`, error.message);
-      return {
-        success: false,
-        error: error.message,
-        platform: platform,
-        data: { results: [] },
-      };
+  const searchPromises = platforms.map((platform) => {
+    switch (platform) {
+      case "twitter":
+        return makeTwitterSearch(query, count);
+      case "telegram":
+        return makeTelegramSearch(query, count); // Using the live function
+      default:
+        return createMockResults(platform, query, count);
     }
   });
 
   try {
-    const results = await Promise.all(searchPromises);
+    const results = await Promise.all(
+      searchPromises.map((p) =>
+        p.catch((e) => ({
+          success: false,
+          error: e.message,
+          data: { platform: e.platform || "unknown" },
+        }))
+      )
+    );
     const platformResults = {};
     let totalResults = 0;
     results.forEach((result) => {
-      platformResults[result.data.platform] = result;
-      if (result.success) {
-        totalResults += result.data.total;
+      if (result && result.data) {
+        const platformName = result.data.platform;
+        platformResults[platformName] = result;
+        if (result.success) {
+          totalResults += result.data.total;
+        }
       }
     });
-
     res.json(
       createStandardResponse(true, {
         platforms: platformResults,
@@ -278,20 +274,31 @@ app.post("/api/search/multi", async (req, res) => {
       })
     );
   } catch (error) {
-    res
-      .status(500)
-      .json(createStandardResponse(false, null, error.message, "multi"));
+    res.status(500).json(createStandardResponse(false, null, error.message));
   }
 });
 
-// --- UPDATED: AI Endpoint with Key Rotation ---
+// --- AI Enhance Endpoint (with key rotation) ---
 app.post("/api/ai/enhance", async (req, res) => {
-  const { text, query } = req.body;
+  const { text, query, service = "openai" } = req.body;
   if (!text) {
     return res
       .status(400)
       .json(
         createStandardResponse(false, null, "Text is required for AI analysis.")
+      );
+  }
+
+  // For now, we only implement OpenAI with rotation. Gemini could be added here.
+  if (service !== "openai") {
+    return res
+      .status(400)
+      .json(
+        createStandardResponse(
+          false,
+          null,
+          "Only OpenAI is supported for AI enhancement currently."
+        )
       );
   }
 
@@ -380,21 +387,6 @@ app.post("/api/ai/enhance", async (req, res) => {
   }
 });
 
-// 404 handler
-app.use((req, res) => {
-  res
-    .status(404)
-    .json(
-      createStandardResponse(
-        false,
-        null,
-        `Endpoint not found: ${req.originalUrl}`
-      )
-    );
-});
-
-app.listen(PORT, "0.0.0.0", () => {
-  console.log(`\n🚀 Kavosh Backend Server is running on port ${PORT}`);
-  console.log(`🔑 Twitter keys loaded: ${apiKeys.twitter.length}`);
-  console.log(`🔑 OpenAI keys loaded: ${apiKeys.openai.length}`);
+app.listen(PORT, () => {
+  console.log(`🚀 Kavosh Backend Server is running on port ${PORT}`);
 });
