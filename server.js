@@ -97,7 +97,7 @@ app.use(
 // --- CORS FIX ---
 const allowedOrigins = [
   "http://localhost:3000",
-  "https://newkavosh.vercel.app",
+  "https://newkavosh.vercel.app", // Your Vercel frontend URL
   process.env.FRONTEND_URL,
 ].filter(Boolean);
 
