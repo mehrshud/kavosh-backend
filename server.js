@@ -1,4 +1,4 @@
-// server.js - Final version with live Telegram search and API key rotation
+// server.js - Final version with dynamic key rotation and live Telegram search
 const express = require("express");
 const cors = require("cors");
 const helmet = require("helmet");
@@ -6,28 +6,27 @@ const rateLimit = require("express-rate-limit");
 const fetch = require("node-fetch");
 require("dotenv").config();
 
-// --- NEW: Telegram and Input dependencies ---
 const { TelegramClient, Api } = require("telegram");
 const { StringSession } = require("telegram/sessions");
-const input = require("input"); // Used for the one-time login prompt
+const input = require("input");
 
 const app = express();
 const PORT = process.env.PORT || 5000;
 
-// --- API Key Manager (for Twitter, OpenAI, etc.) ---
+// --- DYNAMIC API Key Manager ---
+// This function finds all keys for a service (e.g., TWITTER_BEARER_TOKEN, TWITTER_BEARER_TOKEN_2)
+const loadApiKeys = (baseName) => {
+  return Object.keys(process.env)
+    .filter((key) => key.startsWith(baseName))
+    .sort() // Ensures correct order (TOKEN, TOKEN_2, etc.)
+    .map((key) => process.env[key])
+    .filter(Boolean); // Removes any empty keys
+};
+
 const apiKeys = {
-  openai: [
-    process.env.OPENAI_API_KEY,
-    process.env.OPENAI_API_KEY_2,
-    process.env.OPENAI_API_KEY_3,
-  ].filter(Boolean),
-  gemini: [process.env.GEMINI_API_KEY, process.env.GEMINI_API_KEY_2].filter(
-    Boolean
-  ),
-  twitter: [
-    process.env.TWITTER_BEARER_TOKEN,
-    process.env.TWITTER_BEARER_TOKEN_2,
-  ].filter(Boolean),
+  openai: loadApiKeys("OPENAI_API_KEY"),
+  gemini: loadApiKeys("GEMINI_API_KEY"),
+  twitter: loadApiKeys("TWITTER_BEARER_TOKEN"),
 };
 
 const keyManager = {
@@ -47,10 +46,13 @@ const keyManager = {
   },
 };
 
+console.log(`🔑 Loaded ${apiKeys.twitter.length} Twitter keys.`);
+console.log(`🔑 Loaded ${apiKeys.openai.length} OpenAI keys.`);
+console.log(`🔑 Loaded ${apiKeys.gemini.length} Gemini keys.`);
+
 // --- Telegram Client Setup ---
 const telegramApiId = parseInt(process.env.TELEGRAM_API_ID);
 const telegramApiHash = process.env.TELEGRAM_API_HASH;
-// Load session from .env if it exists, otherwise it's empty for the first run
 const telegramSession = new StringSession(process.env.TELEGRAM_SESSION || "");
 
 const telegramClient = new TelegramClient(
@@ -75,8 +77,6 @@ const telegramClient = new TelegramClient(
     });
     console.log("✅ Telegram client is connected and ready.");
 
-    // IMPORTANT: This will print the session string on first successful login.
-    // You MUST copy this string and add it to your .env file as TELEGRAM_SESSION.
     if (!process.env.TELEGRAM_SESSION) {
       console.log("\n--- IMPORTANT ---");
       console.log(
@@ -94,7 +94,24 @@ const telegramClient = new TelegramClient(
 app.use(
   helmet({ contentSecurityPolicy: false, crossOriginEmbedderPolicy: false })
 );
-app.use(cors({ origin: [process.env.FRONTEND_URL, "http://localhost:3000"] }));
+
+const allowedOrigins = [
+  "http://localhost:3000",
+  "https://newkavosh.vercel.app",
+  process.env.FRONTEND_URL,
+].filter(Boolean);
+
+const corsOptions = {
+  origin: function (origin, callback) {
+    if (!origin || allowedOrigins.indexOf(origin) !== -1) {
+      callback(null, true);
+    } else {
+      callback(new Error("Not allowed by CORS"));
+    }
+  },
+};
+app.use(cors(corsOptions));
+
 app.use(express.json());
 const limiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 100 });
 app.use(limiter);
@@ -119,7 +136,9 @@ async function makeTelegramSearch(query, count) {
         q: query,
         limit: count,
         filter: new Api.InputMessagesFilterEmpty(),
-        folderId: null, // Search globally
+        offsetRate: 0,
+        offsetPeer: new Api.InputPeerEmpty(),
+        offsetId: 0,
       })
     );
 
@@ -239,7 +258,7 @@ app.post("/api/search/multi", async (req, res) => {
       case "twitter":
         return makeTwitterSearch(query, count);
       case "telegram":
-        return makeTelegramSearch(query, count); // Using the live function
+        return makeTelegramSearch(query, count);
       default:
         return createMockResults(platform, query, count);
     }
@@ -289,7 +308,6 @@ app.post("/api/ai/enhance", async (req, res) => {
       );
   }
 
-  // For now, we only implement OpenAI with rotation. Gemini could be added here.
   if (service !== "openai") {
     return res
       .status(400)
@@ -363,7 +381,7 @@ app.post("/api/ai/enhance", async (req, res) => {
               )
             );
         }
-        continue; // Retry with the next key
+        continue;
       }
 
       if (!response.ok) {
