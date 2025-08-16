@@ -1,4 +1,4 @@
-// server.js - Final version with CORS fix and live Telegram search
+// server.js - Final version with robust CORS fix and live Telegram search
 const express = require("express");
 const cors = require("cors");
 const helmet = require("helmet");
@@ -53,41 +53,34 @@ console.log(`🔑 Loaded ${apiKeys.gemini.length} Gemini keys.`);
 const telegramApiId = parseInt(process.env.TELEGRAM_API_ID);
 const telegramApiHash = process.env.TELEGRAM_API_HASH;
 const telegramSession = new StringSession(process.env.TELEGRAM_SESSION || "");
+let telegramClient;
 
-const telegramClient = new TelegramClient(
-  telegramSession,
-  telegramApiId,
-  telegramApiHash,
-  {
-    connectionRetries: 5,
-  }
-);
-
-(async () => {
-  try {
-    console.log("Attempting to connect to Telegram...");
-    await telegramClient.start({
-      phoneNumber: process.env.TELEGRAM_PHONE_NUMBER,
-      password: async () =>
-        await input.text("Please enter your 2FA password: "),
-      phoneCode: async () =>
-        await input.text("Please enter the code you received: "),
-      onError: (err) => console.error("Telegram connection error:", err),
-    });
-    console.log("✅ Telegram client is connected and ready.");
-
-    if (!process.env.TELEGRAM_SESSION) {
-      console.log("\n--- IMPORTANT ---");
-      console.log(
-        "COPY THIS SESSION STRING and add it to your environment variables as TELEGRAM_SESSION:"
-      );
-      console.log(telegramClient.session.save());
-      console.log("-----------------\n");
+if (process.env.TELEGRAM_SESSION) {
+  telegramClient = new TelegramClient(
+    telegramSession,
+    telegramApiId,
+    telegramApiHash,
+    {
+      connectionRetries: 5,
     }
-  } catch (err) {
-    console.error("🔴 Failed to connect to Telegram:", err.message);
-  }
-})();
+  );
+  (async () => {
+    try {
+      console.log("Connecting to Telegram using session string...");
+      await telegramClient.connect();
+      console.log("✅ Telegram client is connected and ready.");
+    } catch (err) {
+      console.error(
+        "🔴 Failed to connect to Telegram with session:",
+        err.message
+      );
+    }
+  })();
+} else {
+  console.warn(
+    "⚠️ TELEGRAM_SESSION variable not found. Telegram search will be disabled."
+  );
+}
 
 // --- Middleware Setup ---
 app.use(
@@ -110,6 +103,9 @@ const corsOptions = {
     }
   },
 };
+// This handles pre-flight requests for all routes
+app.options("*", cors(corsOptions));
+// This handles actual requests
 app.use(cors(corsOptions));
 
 app.use(express.json());
@@ -125,9 +121,9 @@ const createStandardResponse = (success, data = null, message = null) => ({
 
 // --- Live Telegram Search Function ---
 async function makeTelegramSearch(query, count) {
-  if (!telegramClient.connected) {
+  if (!telegramClient || !telegramClient.connected) {
     throw new Error(
-      "Telegram client is not connected. Please check server logs."
+      "Telegram client is not connected. Please check server logs and ensure TELEGRAM_SESSION is set."
     );
   }
   try {
