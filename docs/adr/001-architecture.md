@@ -1,0 +1,6 @@
+### ADR for Kavosh-Backend Project
+#### Title: Choosing JavaScript as Primary Language for Kavosh-Backend
+#### Status: Approved
+#### Context: The kavosh-backend project requires a robust and scalable language to handle backend operations. Considering the existing expertise in the team and the need for rapid development, a decision on the primary language is crucial.
+#### Decision: After evaluating various options, it has been decided to use JavaScript as the primary language for the kavosh-backend project. Node.js, a JavaScript runtime, will be utilized to create a fast and lightweight backend framework.
+#### Consequences: This decision will allow for faster development and easier maintenance due to the team's familiarity with JavaScript. Additionally, the vast ecosystem of Node.js packages will provide access to a wide range of libraries and tools, streamlining the development process. However, it may also introduce additional complexity due to the asynchronous nature of JavaScript, requiring careful handling of callbacks and promises.
