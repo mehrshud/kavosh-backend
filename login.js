@@ -1,35 +1,43 @@
-// login.js - Run this file once to get your Telegram session string.
-require("dotenv").config();
-const { TelegramClient } = require("telegram");
-const { StringSession } = require("telegram/sessions");
-const input = require("input");
 
-const apiId = parseInt(process.env.TELEGRAM_API_ID);
-const apiHash = process.env.TELEGRAM_API_HASH;
-const stringSession = new StringSession("");
+// Import required modules
+const express = require('express');
+const router = express.Router();
+const bcrypt = require('bcrypt');
+const jwt = require('jsonwebtoken');
 
-(async () => {
-  console.log("Starting Telegram login process...");
-  const client = new TelegramClient(stringSession, apiId, apiHash, {
-    connectionRetries: 5,
-  });
+// Define a function to handle login
+async function handleLogin(req, res) {
+  try {
+    // Get the username and password from the request body
+    const { username, password } = req.body;
 
-  await client.start({
-    phoneNumber: process.env.TELEGRAM_PHONE_NUMBER,
-    password: async () => await input.text("Please enter your 2FA password: "),
-    phoneCode: async () =>
-      await input.text("Please enter the code you received: "),
-    onError: (err) => console.log(err),
-  });
+    // Check if the username and password are provided
+    if (!username || !password) {
+      return res.status(400).json({ message: 'Username and password are required' });
+    }
 
-  console.log("\n✅ You are now logged in.");
-  console.log("\n--- IMPORTANT ---");
-  console.log(
-    "COPY THIS SESSION STRING and add it to your Railway environment variables as TELEGRAM_SESSION:"
-  );
-  console.log(client.session.save());
-  console.log("-----------------\n");
+    // Hash the password
+    const hashedPassword = await bcrypt.hash(password, 10);
 
-  await client.disconnect();
-  process.exit(0);
-})();
+    // Compare the provided password with the hashed password
+    const isValidPassword = await bcrypt.compare(password, hashedPassword);
+
+    // If the password is valid, generate a JWT token
+    if (isValidPassword) {
+      const token = jwt.sign({ username }, process.env.SECRET_KEY, {
+        expiresIn: '1h',
+      });
+
+      return res.json({ token });
+    } else {
+      return res.status(401).json({ message: 'Invalid username or password' });
+    }
+  } catch (error) {
+    return res.status(500).json({ message: 'Internal server error' });
+  }
+}
+
+// Define the login route
+router.post('/login', handleLogin);
+
+module.exports = router;
